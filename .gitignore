@@ -1,0 +1,23 @@
+# Pulumi state (local backend)
+.pulumi/
+
+# Dependencies
+node_modules/
+
+# Build outputs
+bin/
+
+# Environment files
+.env
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
