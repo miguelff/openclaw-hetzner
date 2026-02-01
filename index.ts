@@ -73,6 +73,11 @@ set -e
 
 export DEBIAN_FRONTEND=noninteractive
 
+# Store secrets in variables (base64 encoded to avoid shell interpretation issues)
+ANTHROPIC_KEY_B64="${Buffer.from(anthropicApiKey).toString("base64")}"
+TAILSCALE_KEY_B64="${Buffer.from(tailscaleAuthKey).toString("base64")}"
+GATEWAY_TOKEN_B64="${Buffer.from(gwToken).toString("base64")}"
+
 # System updates
 apt-get update
 apt-get upgrade -y
@@ -83,42 +88,50 @@ systemctl enable docker
 systemctl start docker
 
 # Create ubuntu user (Hetzner uses root by default)
-useradd -m -s /bin/bash -G docker ubuntu || true
+useradd -m -s /bin/bash -G docker,sudo ubuntu || true
 
-# Install NVM and Node.js for ubuntu user
-sudo -u ubuntu bash << 'UBUNTU_SCRIPT'
-set -e
-cd ~
+# Enable passwordless sudo for ubuntu
+echo "ubuntu ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/ubuntu
+chmod 440 /etc/sudoers.d/ubuntu
 
-# Install NVM
-curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+# Copy root's authorized_keys to ubuntu for SSH access
+mkdir -p /home/ubuntu/.ssh
+cp /root/.ssh/authorized_keys /home/ubuntu/.ssh/
+chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+chmod 700 /home/ubuntu/.ssh
+chmod 600 /home/ubuntu/.ssh/authorized_keys
 
-# Load NVM
-export NVM_DIR="$HOME/.nvm"
-[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+# Install Node.js 22 via NodeSource (system-wide)
+curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+apt-get install -y nodejs
 
-# Install Node.js 22
-nvm install 22
-nvm use 22
-nvm alias default 22
+# Install OpenClaw and MCP tools globally
+npm install -g openclaw@latest @presto-ai/google-workspace-mcp
 
-# Install OpenClaw
-npm install -g openclaw@latest
+# Install Homebrew dependencies
+apt-get install -y build-essential procps curl file git
 
-# Add NVM to bashrc if not already there
-if ! grep -q 'NVM_DIR' ~/.bashrc; then
-    echo 'export NVM_DIR="$HOME/.nvm"' >> ~/.bashrc
-    echo '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"' >> ~/.bashrc
-fi
-UBUNTU_SCRIPT
+# Prepare Homebrew directory and install as ubuntu user
+mkdir -p /home/linuxbrew
+chown ubuntu:ubuntu /home/linuxbrew
+sudo -u ubuntu bash << 'BREW_SCRIPT'
+NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+echo 'eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"' >> ~/.bashrc
+eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
 
-# Set environment variables for ubuntu user
-echo 'export ANTHROPIC_API_KEY="${anthropicApiKey}"' >> /home/ubuntu/.bashrc
+# Install common skill dependencies
+brew install gh ffmpeg jq ripgrep uv
+BREW_SCRIPT
+
+# Decode and set environment variables for ubuntu user
+ANTHROPIC_KEY=$(echo "$ANTHROPIC_KEY_B64" | base64 -d)
+echo "export ANTHROPIC_API_KEY='$ANTHROPIC_KEY'" >> /home/ubuntu/.bashrc
 
 # Install and configure Tailscale
 echo "Installing Tailscale..."
 curl -fsSL https://tailscale.com/install.sh | sh
-tailscale up --authkey="${tailscaleAuthKey}" --ssh || echo "WARNING: Tailscale setup failed. Run 'sudo tailscale up' manually."
+TAILSCALE_KEY=$(echo "$TAILSCALE_KEY_B64" | base64 -d)
+tailscale up --authkey="$TAILSCALE_KEY" --ssh || echo "WARNING: Tailscale setup failed. Run 'sudo tailscale up' manually."
 
 # Enable systemd linger for ubuntu user (required for user services to run at boot)
 loginctl enable-linger ubuntu
@@ -126,59 +139,30 @@ loginctl enable-linger ubuntu
 # Start user's systemd instance (required for user services during cloud-init)
 systemctl start user@1000.service
 
-# Run OpenClaw onboarding as ubuntu user (skip daemon install, do it separately)
-echo "Running OpenClaw onboarding..."
-sudo -H -u ubuntu ANTHROPIC_API_KEY="${anthropicApiKey}" GATEWAY_PORT="${gatewayPort}" bash -c '
-export HOME=/home/ubuntu
-export NVM_DIR="$HOME/.nvm"
-[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+# Create openclaw directories
+sudo -u ubuntu mkdir -p /home/ubuntu/.openclaw/credentials
 
-openclaw onboard --non-interactive --accept-risk \\
-    --mode local \\
-    --auth-choice apiKey \\
-    --gateway-port $GATEWAY_PORT \\
-    --gateway-bind loopback \\
-    --skip-daemon \\
-    --skip-skills || echo "WARNING: OpenClaw onboarding failed. Run openclaw onboard manually."
-'
-
-# Install daemon service with XDG_RUNTIME_DIR set
-echo "Installing OpenClaw daemon..."
-sudo -H -u ubuntu XDG_RUNTIME_DIR=/run/user/1000 bash -c '
-export HOME=/home/ubuntu
-export NVM_DIR="$HOME/.nvm"
-[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
-
-openclaw daemon install || echo "WARNING: Daemon install failed. Run openclaw daemon install manually."
-'
-
-# Configure gateway for Tailscale Serve (trustedProxies + skip device pairing + set token)
-echo "Configuring gateway for Tailscale Serve..."
-sudo -H -u ubuntu GATEWAY_TOKEN="${gwToken}" python3 << 'PYTHON_SCRIPT'
-import json
-import os
-config_path = "/home/ubuntu/.openclaw/openclaw.json"
-with open(config_path) as f:
-    config = json.load(f)
-config["gateway"]["trustedProxies"] = ["127.0.0.1"]
-config["gateway"]["controlUi"] = {
-    "enabled": True,
-    "allowInsecureAuth": True
-}
-config["gateway"]["auth"] = {
-    "mode": "token",
-    "token": os.environ["GATEWAY_TOKEN"]
-}
-with open(config_path, "w") as f:
-    json.dump(config, f, indent=2)
-print("Configured gateway with trustedProxies, controlUi, and token")
-PYTHON_SCRIPT
+# Save environment variables for later use during onboarding
+GATEWAY_TOKEN=$(echo "$GATEWAY_TOKEN_B64" | base64 -d)
+cat > /home/ubuntu/.openclaw/.env << ENVFILE
+ANTHROPIC_API_KEY=$ANTHROPIC_KEY
+GATEWAY_TOKEN=$GATEWAY_TOKEN
+ENVFILE
+chown ubuntu:ubuntu /home/ubuntu/.openclaw/.env
+chmod 600 /home/ubuntu/.openclaw/.env
 
 # Enable Tailscale HTTPS proxy (requires HTTPS to be enabled in Tailscale admin console)
 echo "Enabling Tailscale HTTPS proxy..."
 tailscale serve --bg ${gatewayPort} || echo "WARNING: tailscale serve failed. Enable HTTPS in your Tailscale admin console first."
 
-echo "OpenClaw setup complete!"
+echo ""
+echo "=============================================="
+echo "OpenClaw prerequisites installed!"
+echo ""
+echo "To complete setup, SSH in and run:"
+echo "  ssh ubuntu@$(hostname)"
+echo "  openclaw onboard --install-daemon"
+echo "=============================================="
 `;
 });
 

@@ -131,9 +131,32 @@ pulumi stack init dev
 npm run deploy
 ```
 
-## Access OpenClaw
+## Complete Setup
 
-After deployment, wait 3-5 minutes for cloud-init to complete provisioning.
+After deployment, wait 3-5 minutes for cloud-init to complete, then run onboarding:
+
+```bash
+# SSH into the server via Tailscale
+ssh ubuntu@<server-name>
+
+# Or via public IP (get IP with: dotenv -- pulumi stack output ipv4Address)
+ssh -i /tmp/openclaw-key.pem root@<ip-address>
+su - ubuntu
+
+# Run interactive onboarding
+openclaw onboard --install-daemon
+```
+
+Follow the prompts to configure authentication, channels (WhatsApp, Telegram, etc.), and skills.
+
+After onboarding, verify the setup:
+```bash
+openclaw doctor
+openclaw status
+openclaw health
+```
+
+## Access OpenClaw
 
 ```bash
 # Get the URL with authentication token
